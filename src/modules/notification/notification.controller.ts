@@ -1,6 +1,8 @@
 import { Request, Response } from 'express';
 import service from './notification.service';
 import { NotificationCategory } from '@prisma/client';
+import { publishRealtimeNotification } from '@/kafka/producer';
+import logger from '@/utils/logger';
 
 function tenant(req: Request) {
   return req.user!.tenantId!;
@@ -23,6 +25,25 @@ export class NotificationController {
       sourceEventId: req.body.sourceEventId ? String(req.body.sourceEventId) : undefined,
       sourceTopic: req.body.sourceTopic ? String(req.body.sourceTopic) : undefined,
     });
+    try {
+      const data = (req.body.data && typeof req.body.data === 'object') ? req.body.data : {};
+      const eventType = typeof data.eventType === 'string' ? data.eventType : undefined;
+      await publishRealtimeNotification({
+        tenantId: created.tenantId,
+        userId: created.userId,
+        type: eventType ? `${created.category}.${eventType}` : String(created.category),
+        title: created.title,
+        message: created.message,
+        severity: created.severity,
+        data: {
+          ...data,
+          actionUrl: created.actionUrl,
+          notificationId: created.id,
+        },
+      });
+    } catch (error: any) {
+      logger.error('[notifications] failed to publish realtime notification: %s', error.message);
+    }
     res.status(201).json(created);
   }
 

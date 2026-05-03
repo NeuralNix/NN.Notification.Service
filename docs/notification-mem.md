@@ -694,3 +694,74 @@ Schema bootstrap log line to look for:
 4. For existing users that suddenly see nothing: backfill probably
    didn't run. Manually backfill with the two `INSERT ... ON CONFLICT DO
    NOTHING` statements from `ensureSchema()`.
+
+## May 3 2026 — Operations notification service-create path and realtime publish
+
+### Requirement
+
+Operations Dashboard users need bell/realtime notifications when:
+
+- estimates, jobs, and invoices are created
+- estimates/invoices are partially or fully paid
+- jobs are started
+- jobs are completed
+
+Some of these events originate from authenticated dashboard requests, but
+public customer payment sync callbacks can run without a bearer token. Those
+server-side Operations callbacks still need to create tenant-scoped broadcast
+notifications safely.
+
+### Notification Service changes
+
+- `src/middleware/jwtAuth.ts` now allows a narrow trusted service-create path:
+  `POST /api/notifications` with no bearer token is accepted only when both
+  headers are present and valid:
+  - `X-Organization-Id: <tenant uuid>`
+  - `X-Notification-Proxy-Secret: <NOTIFICATION_PROXY_SECRET>`
+- The trusted path seeds a service user and then `requireTenant` applies the
+  supplied tenant. Anonymous reads and all other anonymous notification routes
+  still return `401`.
+- `src/modules/notification/notification.controller.ts` now publishes a
+  realtime websocket notification after REST-created notifications are
+  persisted. Event type is `category.eventType` when `data.eventType` exists,
+  otherwise just `category`.
+- The realtime payload includes persisted `actionUrl` and `notificationId` in
+  `data`, so the Platform bell can refetch history and still open the target
+  page from the live event.
+
+### Contract used by Operations
+
+Operations uses existing Prisma notification categories to avoid an enum
+migration:
+
+- estimates: `category=estimate`
+- invoices/payments: `category=payment`
+- jobs: `category=system`
+
+Important `data.eventType` values emitted by Operations:
+
+- `created`
+- `partial_paid` / `paid`
+- `invoice_created`
+- `invoice_partial_paid` / `invoice_paid`
+- `job_created` / `job_started` / `job_completed`
+
+Idempotency still uses `(tenantId, sourceEventId, category)`. Operations sets
+stable source ids such as `estimate:{id}:created`, `invoice:{id}:created`,
+`job:{id}:started`, or the payment gateway session id for payment events.
+
+### Validation
+
+```sh
+cd /home/neura/project/NN.Notification.Service && docker compose up -d --build notification-service
+```
+
+- Docker build ran `npx prisma generate && npm run build` successfully.
+- Container logged `Notification Service HTTP listening on :5070` and
+  `[KafkaConsumer] subscribed to payment.events`.
+- `GET http://127.0.0.1:5070/api/notifications` without auth returned `401`.
+- Trusted service create with a random tenant id returned `201`.
+- The smoke row was deleted afterward with Prisma from inside
+  `nn-notification-service` (`deleted:1`).
+- The trusted create smoke connected the Kafka producer, confirming realtime
+  publish did not fail on the new REST-created notification path.

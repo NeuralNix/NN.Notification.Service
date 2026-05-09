@@ -24,6 +24,16 @@ export interface ListQuery {
   maxResultCount?: number;
 }
 
+function shouldReplaceExistingNotification(
+  existing: { sourceTopic: string | null },
+  input: CreateNotificationInput,
+) {
+  return existing.sourceTopic === 'payment.events'
+    && !!input.sourceTopic
+    && input.sourceTopic.startsWith('operations.')
+    && !!input.sourceEventId;
+}
+
 export class NotificationService {
   async create(input: CreateNotificationInput) {
     // Idempotent on (sourceEventId, category) when sourceEventId is given,
@@ -33,6 +43,25 @@ export class NotificationService {
         where: { tenantId: input.tenantId, sourceEventId: input.sourceEventId, category: input.category },
       });
       if (existing) {
+        if (shouldReplaceExistingNotification(existing, input)) {
+          logger.info(
+            'Replacing fallback notification for sourceEventId=%s with sourceTopic=%s',
+            input.sourceEventId,
+            input.sourceTopic,
+          );
+          return prisma.notification.update({
+            where: { id: existing.id },
+            data: {
+              userId: input.userId ?? null,
+              severity: input.severity ?? 'info',
+              title: input.title.substring(0, 200),
+              message: input.message.substring(0, 2000),
+              actionUrl: input.actionUrl,
+              data: (input.data ?? {}) as Prisma.JsonObject,
+              sourceTopic: input.sourceTopic,
+            },
+          });
+        }
         logger.info('Notification already exists for sourceEventId=%s, skipping', input.sourceEventId);
         return existing;
       }

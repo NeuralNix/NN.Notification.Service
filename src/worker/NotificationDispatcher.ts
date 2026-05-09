@@ -65,6 +65,20 @@ export async function dispatchPaymentEvent(evt: PaymentEvent): Promise<void> {
     }, notificationUserId);
   }
 
+  // Estimate-payment notifications are owned by Operations. Its callback path
+  // creates the canonical bell row and publishes realtime with the aggregate
+  // partial-vs-full status. Creating a second row here races that authoritative
+  // path and can leave a stale fallback title in place for the same session.
+  if (isEstimate) {
+    if (!opsResult) {
+      logger.warn(
+        '[dispatch] skipping direct estimate notification for %s because operations callback did not return a result',
+        evt.estimateId,
+      );
+    }
+    return;
+  }
+
   const isPartial = opsResult?.paymentStatus === PAYMENT_STATUS.PartiallyPaid;
   const remaining = opsResult?.amountRemaining ?? 0;
   const currencyUpper = evt.currency.toUpperCase();

@@ -22,6 +22,10 @@ export interface ListQuery {
   category?: NotificationCategory;
   skipCount?: number;
   maxResultCount?: number;
+  /// Categories this user may see as tenant broadcasts (dashboard-access
+  /// scoping). null/undefined = unrestricted (admins, service principals).
+  /// User-targeted rows are always visible regardless of this list.
+  allowedCategories?: NotificationCategory[] | null;
 }
 
 function shouldReplaceExistingNotification(
@@ -109,13 +113,18 @@ export class NotificationService {
   ///      it). This keeps the existing cross-tenant override path for
   ///      operators that switched active org while making sure brand-new
   ///      users don't inherit notifications from "other dashboards".
+  ///   Broadcast rows (branch 1) are additionally scoped by the caller's
+  ///   dashboard access: a user without the Operations Dashboard never sees
+  ///   estimate/invoice/job broadcasts. Targeted rows (branches 2-3) are
+  ///   exempt — they were explicitly addressed to the user.
   private async buildVisibility(
     tenantId: string,
     userId: string | undefined,
+    allowedCategories?: NotificationCategory[] | null,
   ): Promise<Prisma.NotificationWhereInput[]> {
-    const branches: Prisma.NotificationWhereInput[] = [
-      { tenantId, userId: null },
-    ];
+    const broadcast: Prisma.NotificationWhereInput = { tenantId, userId: null };
+    if (allowedCategories) broadcast.category = { in: allowedCategories };
+    const branches: Prisma.NotificationWhereInput[] = [broadcast];
     if (!userId) return branches;
     branches.push({ tenantId, userId });
     const otherTenants = await prisma.notificationVisibilityCutoff.findMany({
@@ -138,7 +147,7 @@ export class NotificationService {
     const sinceAt = q.userId
       ? await this.getOrCreateCutoff(q.tenantId, q.userId)
       : new Date(0);
-    const visibility = await this.buildVisibility(q.tenantId, q.userId);
+    const visibility = await this.buildVisibility(q.tenantId, q.userId, q.allowedCategories);
     const where: Prisma.NotificationWhereInput = {
       AND: [
         { OR: visibility },
@@ -168,9 +177,13 @@ export class NotificationService {
     return { items, total };
   }
 
-  async unreadCount(tenantId: string, userId: string) {
+  async unreadCount(
+    tenantId: string,
+    userId: string,
+    allowedCategories?: NotificationCategory[] | null,
+  ) {
     const sinceAt = await this.getOrCreateCutoff(tenantId, userId);
-    const visibility = await this.buildVisibility(tenantId, userId);
+    const visibility = await this.buildVisibility(tenantId, userId, allowedCategories);
     return prisma.notification.count({
       where: {
         AND: [
@@ -182,9 +195,14 @@ export class NotificationService {
     });
   }
 
-  async markRead(id: string, tenantId: string, userId: string) {
+  async markRead(
+    id: string,
+    tenantId: string,
+    userId: string,
+    allowedCategories?: NotificationCategory[] | null,
+  ) {
     const sinceAt = await this.getOrCreateCutoff(tenantId, userId);
-    const visibility = await this.buildVisibility(tenantId, userId);
+    const visibility = await this.buildVisibility(tenantId, userId, allowedCategories);
     const n = await prisma.notification.findFirst({
       where: {
         id,
@@ -208,11 +226,15 @@ export class NotificationService {
     );
   }
 
-  async markAllRead(tenantId: string, userId: string) {
+  async markAllRead(
+    tenantId: string,
+    userId: string,
+    allowedCategories?: NotificationCategory[] | null,
+  ) {
     // Find every visible-to-user notification that does NOT yet have a
     // receipt for this user, then create the receipts in one shot.
     const sinceAt = await this.getOrCreateCutoff(tenantId, userId);
-    const visibility = await this.buildVisibility(tenantId, userId);
+    const visibility = await this.buildVisibility(tenantId, userId, allowedCategories);
     const targets = await prisma.notification.findMany({
       where: {
         AND: [

@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import service from './notification.service';
 import { NotificationCategory } from '@prisma/client';
 import { publishRealtimeNotification } from '@/kafka/producer';
+import { resolveAllowedCategories, requiredDashboardsFor } from '@/access/dashboardAccess';
 import logger from '@/utils/logger';
 
 function tenant(req: Request) {
@@ -9,6 +10,13 @@ function tenant(req: Request) {
 }
 function user(req: Request) {
   return req.user!.userId;
+}
+function bearer(req: Request): string | undefined {
+  const auth = req.headers.authorization;
+  return auth?.startsWith('Bearer ') ? auth.substring('Bearer '.length).trim() : undefined;
+}
+function allowed(req: Request) {
+  return resolveAllowedCategories(req.user!, bearer(req));
 }
 
 export class NotificationController {
@@ -35,6 +43,7 @@ export class NotificationController {
         title: created.title,
         message: created.message,
         severity: created.severity,
+        requiredDashboards: requiredDashboardsFor(String(created.category)),
         data: {
           ...data,
           actionUrl: created.actionUrl,
@@ -58,23 +67,24 @@ export class NotificationController {
       category: req.query.category ? (String(req.query.category) as NotificationCategory) : undefined,
       skipCount: req.query.skipCount ? Number(req.query.skipCount) : 0,
       maxResultCount: req.query.maxResultCount ? Number(req.query.maxResultCount) : 50,
+      allowedCategories: await allowed(req),
     });
     res.json(result);
   }
 
   async unreadCount(req: Request, res: Response) {
-    const count = await service.unreadCount(tenant(req), user(req));
+    const count = await service.unreadCount(tenant(req), user(req), await allowed(req));
     res.json({ count });
   }
 
   async markRead(req: Request, res: Response) {
-    const n = await service.markRead(req.params.id, tenant(req), user(req));
+    const n = await service.markRead(req.params.id, tenant(req), user(req), await allowed(req));
     if (!n) return res.status(404).json({ message: 'Notification not found' });
     res.json(n);
   }
 
   async markAllRead(req: Request, res: Response) {
-    const updated = await service.markAllRead(tenant(req), user(req));
+    const updated = await service.markAllRead(tenant(req), user(req), await allowed(req));
     res.json({ updated });
   }
 }

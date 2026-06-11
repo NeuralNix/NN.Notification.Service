@@ -14,6 +14,12 @@ async function ensureSchema() {
   // users would inherit every historical broadcast notification of the
   // dashboard/org they joined.
   try {
+    // HR notifications (leave reviewed, payslip issued, …) were added after
+    // the enum was first pushed. ADD VALUE is idempotent and must run before
+    // any 'hr' row is written.
+    await prisma.$executeRawUnsafe(
+      `ALTER TYPE "NotificationCategory" ADD VALUE IF NOT EXISTS 'hr';`
+    );
     await prisma.$executeRawUnsafe(
       `CREATE TABLE IF NOT EXISTS "NotificationVisibilityCutoffs" (
          "tenantId" uuid NOT NULL,

@@ -27,6 +27,10 @@ export async function publishRealtimeNotification(payload: {
   title: string;
   message: string;
   severity?: 'info' | 'success' | 'warn' | 'error';
+  /// Dashboards whose users may receive this as a tenant broadcast; empty or
+  /// absent = unrestricted. The WebSocket Gateway filters tenant-room emits
+  /// with this so realtime toasts match the bell's dashboard-access scoping.
+  requiredDashboards?: string[];
   data?: Record<string, unknown>;
 }) {
   const p = await getProducer();

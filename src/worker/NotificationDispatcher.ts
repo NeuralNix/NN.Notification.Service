@@ -1,6 +1,7 @@
 import notificationService from '@/modules/notification/notification.service';
 import { publishRealtimeNotification } from '@/kafka/producer';
 import { updateEstimatePaymentStatus, PAYMENT_STATUS } from '@/clients/operationsClient';
+import { requiredDashboardsFor } from '@/access/dashboardAccess';
 import logger from '@/utils/logger';
 
 // Accept any RFC 4122 UUID layout (v1-v8). Auth Server issues v7 (timestamp-
@@ -141,6 +142,7 @@ export async function dispatchPaymentEvent(evt: PaymentEvent): Promise<void> {
       title,
       message,
       severity: 'success',
+      requiredDashboards: requiredDashboardsFor(isEstimate ? 'estimate' : 'payment'),
       data: {
         estimateId: evt.estimateId,
         invoiceId: evt.invoiceId,

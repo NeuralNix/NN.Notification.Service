@@ -19,6 +19,7 @@ enum NotificationCategory {
   shipping
   inventory
   hr
+  calldesk
 }
 
 enum NotificationSeverity {

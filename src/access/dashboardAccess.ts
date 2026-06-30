@@ -36,6 +36,7 @@ export const CATEGORY_DASHBOARDS: Record<NotificationCategory, string[]> = {
   shipping: ['ecommerce'],
   inventory: ['inventory'],
   hr: ['hr'],
+  calldesk: ['calldesk'],
 };
 
 export const ALL_CATEGORIES = Object.keys(CATEGORY_DASHBOARDS) as NotificationCategory[];

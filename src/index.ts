@@ -2,6 +2,7 @@ import 'dotenv/config';
 import { createApp } from './app';
 import logger from './utils/logger';
 import { startKafkaPaymentConsumer, stopKafkaPaymentConsumer } from './worker/KafkaPaymentConsumer';
+import { startKafkaPlatformConnectionConsumer, stopKafkaPlatformConnectionConsumer } from './worker/KafkaPlatformConnectionConsumer';
 import { disconnectProducer } from './kafka/producer';
 import prisma from './config/prisma';
 
@@ -67,15 +68,18 @@ async function main() {
 
   await ensureSchema();
 
-  // Run the Kafka consumer in the same process so a single container exposes
+  // Run the Kafka consumers in the same process so a single container exposes
   // both REST and the dispatcher worker. Split into a worker-server.ts later
   // if horizontal scaling needs separate scaling profiles.
   await startKafkaPaymentConsumer();
+  // Platform connect/disconnect (Auth Server) → ShipExa-scoped bell + toast.
+  await startKafkaPlatformConnectionConsumer();
 
   const shutdown = async (signal: string) => {
     logger.info('Received %s, shutting down…', signal);
     server.close();
     await stopKafkaPaymentConsumer();
+    await stopKafkaPlatformConnectionConsumer();
     await disconnectProducer();
     await prisma.$disconnect();
     process.exit(0);

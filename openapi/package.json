@@ -1,0 +1,11 @@
+{
+  "name": "nn-notification-service-openapi",
+  "private": true,
+  "description": "Standalone OpenAPI emitter for the agent-facing surface. Self-contained: lives outside src/ so the service build and lockfile are untouched. Run: npm install && npm run emit",
+  "scripts": { "emit": "tsx emit.ts" },
+  "dependencies": {
+    "@asteasolutions/zod-to-openapi": "^7.3.0",
+    "tsx": "^4.19.0",
+    "zod": "^3.23.8"
+  }
+}

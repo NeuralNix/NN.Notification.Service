@@ -20,6 +20,9 @@ enum NotificationCategory {
   inventory
   hr
   calldesk
+  /// Customer-service escalations raised by the E-commerce Care agent
+  /// (website chat / phone). Broadcast — nobody is targeted by user id.
+  support
 }
 
 enum NotificationSeverity {

@@ -37,6 +37,9 @@ export const CATEGORY_DASHBOARDS: Record<NotificationCategory, string[]> = {
   inventory: ['inventory'],
   hr: ['hr'],
   calldesk: ['calldesk'],
+  // A customer waiting on a refund/return/repair is e-commerce work, but
+  // Operations is who actually actions it — either dashboard may see it.
+  support: ['ecommerce', 'operations'],
 };
 
 export const ALL_CATEGORIES = Object.keys(CATEGORY_DASHBOARDS) as NotificationCategory[];

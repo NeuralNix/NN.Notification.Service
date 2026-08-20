@@ -1,5 +1,6 @@
 import prisma from '@/config/prisma';
 import { NotificationCategory, NotificationSeverity, Prisma } from '@prisma/client';
+import { sendAdminNotificationEmail } from '@/email/adminNotificationEmail';
 import logger from '@/utils/logger';
 
 export interface CreateNotificationInput {
@@ -70,7 +71,7 @@ export class NotificationService {
         return existing;
       }
     }
-    return prisma.notification.create({
+    const created = await prisma.notification.create({
       data: {
         tenantId: input.tenantId,
         userId: input.userId ?? null,
@@ -84,6 +85,23 @@ export class NotificationService {
         sourceTopic: input.sourceTopic,
       },
     });
+
+    // Mail the tenant's admins about the new notification. Deliberately only
+    // on this path: the idempotent short-circuit and the fallback-replace
+    // branch above both return pre-existing rows, and re-delivered Kafka
+    // messages must not produce duplicate alerts.
+    //
+    // Not awaited on purpose. The alert needs HR (for recipients) and the Auth
+    // Server (for the org slug); awaiting would make creating a notification —
+    // including the bell POST and every Kafka dispatcher — as slow and as
+    // available as those two services, up to the HR client's timeout. The
+    // function never rejects, so a floating promise here cannot produce an
+    // unhandled rejection. Trade-off: an alert in flight when the process
+    // stops is lost, which is the right side to fail on for a best-effort
+    // notification email.
+    void sendAdminNotificationEmail(created);
+
+    return created;
   }
 
   /// Lazily anchor the earliest notification a (tenant,user) pair may see.

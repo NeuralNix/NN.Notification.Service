@@ -1,76 +1,107 @@
-// Service-to-service auth: requests a system JWT from NN.Auth.Server.Backend
-// using a shared API key. Cached and refreshed before expiry.
+// Service-to-service auth: obtains an organization-scoped machine token from
+// NN.Auth.Server.Backend (`POST /api/auth/service-token`) using the shared
+// service API key. Cached per tenant and refreshed before expiry.
+//
+// ── Why this no longer mints its own tokens ──
+// This module used to sign its own JWT asserting `roles: ['SystemAdmin']` when
+// the Auth Server was unreachable (and, because AUTH_SERVICE_API_KEY was blank
+// in every deployment, that fallback was in fact the ONLY path ever taken).
+// Two problems with that: the token claimed global admin when all it needed was
+// one organization, and the Auth Server had no way to tell an internal caller
+// apart from a real administrator — it just honoured the role claim.
+//
+// The Auth Server now issues proper service tokens: scoped to one organization,
+// carrying `token_use=service` and NO role claims, short-lived, and audited at
+// issuance. Local minting is gone. If the Auth Server cannot issue a token, the
+// caller gets null and degrades — a silent self-signed admin credential is not
+// a safe failure mode.
 
 import axios from 'axios';
-import jwt from 'jsonwebtoken';
 import logger from '@/utils/logger';
 
-const AUTH_API_URL = process.env.AUTH_API_URL || '';
+const AUTH_API_URL = (process.env.AUTH_API_URL || '').replace(/\/$/, '');
 const SERVICE_API_KEY = process.env.AUTH_SERVICE_API_KEY || '';
-const JWT_SECRET_KEY = process.env.JWT_SECRET_KEY || '';
-const JWT_ISSUER = process.env.JWT_ISSUER || '';
-const JWT_AUDIENCE = process.env.JWT_AUDIENCE || '';
+const SERVICE_NAME = process.env.AUTH_SERVICE_NAME || 'notification-service';
+const REQUEST_TIMEOUT_MS = Number(process.env.AUTH_REQUEST_TIMEOUT_MS || 8_000);
+// Refresh this long before expiry so an in-flight request never carries a
+// token that expires mid-call.
+const EXPIRY_SKEW_MS = 60_000;
 
-let cachedToken: { value: string; expiresAt: number } | null = null;
+interface CachedToken {
+  value: string;
+  expiresAt: number;
+}
 
-function buildTenantScopedFallbackToken(tenantId: string, userId?: string | null): string | null {
-  if (!JWT_SECRET_KEY || !JWT_ISSUER || !JWT_AUDIENCE || !tenantId) {
-    return null;
-  }
+/** Cached per tenant: a service token is scoped to exactly one organization. */
+const tokenCache = new Map<string, CachedToken>();
 
-  const subject = userId?.trim() || 'notification-service';
-  return jwt.sign(
-    {
-      sub: subject,
-      userId: subject,
-      tenant_id: tenantId,
-      roles: ['SystemAdmin'],
-      service: 'notification-service',
-    },
-    JWT_SECRET_KEY,
-    {
-      algorithm: 'HS256',
-      issuer: JWT_ISSUER,
-      audience: JWT_AUDIENCE,
-      expiresIn: '1h',
-    },
+/** Throttles the "not configured" warning so it doesn't flood the log. */
+let warnedMissingConfig = 0;
+
+function warnMissingConfigOnce(): void {
+  const now = Date.now();
+  if (now - warnedMissingConfig < 300_000) return;
+  warnedMissingConfig = now;
+  logger.warn(
+    '[auth] Cannot obtain service tokens: %s%s. Service-to-service calls that need one will be skipped.',
+    !AUTH_API_URL ? 'AUTH_API_URL is not set' : '',
+    !SERVICE_API_KEY ? `${!AUTH_API_URL ? '; ' : ''}AUTH_SERVICE_API_KEY is empty` : '',
   );
 }
 
-export async function getServiceToken(tenantId?: string, userId?: string | null): Promise<string | null> {
-  // Optional: only used when wanting authenticated calls into Operations etc.
+/**
+ * An organization-scoped service token, or null when one cannot be obtained.
+ * Callers must treat null as "skip this call", never as "proceed unauthenticated".
+ */
+export async function getServiceToken(
+  tenantId?: string,
+  _userId?: string | null,
+): Promise<string | null> {
+  if (!tenantId) {
+    logger.warn('[auth] getServiceToken called without a tenant — service tokens must be org-scoped');
+    return null;
+  }
   if (!AUTH_API_URL || !SERVICE_API_KEY) {
-    const fallback = tenantId ? buildTenantScopedFallbackToken(tenantId, userId) : null;
-    if (!fallback) {
-      logger.warn('[auth] No AUTH_SERVICE_API_KEY configured and JWT fallback is unavailable');
-    }
-    return fallback;
+    warnMissingConfigOnce();
+    return null;
   }
 
-  const now = Date.now();
-  if (cachedToken && cachedToken.expiresAt - 60_000 > now) return cachedToken.value;
+  const cached = tokenCache.get(tenantId);
+  if (cached && cached.expiresAt - EXPIRY_SKEW_MS > Date.now()) return cached.value;
 
   try {
-    const url = `${AUTH_API_URL.replace(/\/$/, '')}/api/auth/service-token`;
     const res = await axios.post(
-      url,
-      { service: 'notification-service' },
-      { headers: { 'X-API-Key': SERVICE_API_KEY }, timeout: 5_000 }
+      `${AUTH_API_URL}/api/auth/service-token`,
+      { service: SERVICE_NAME, organizationId: tenantId },
+      {
+        headers: {
+          'X-Service-Api-Key': SERVICE_API_KEY,
+          'Content-Type': 'application/json',
+        },
+        timeout: REQUEST_TIMEOUT_MS,
+      },
     );
-    const token = res.data?.access_token ?? res.data?.token;
-    const expiresIn = Number(res.data?.expires_in ?? 3600);
+
+    const token: string | undefined = res.data?.accessToken ?? res.data?.access_token;
+    const expiresIn = Number(res.data?.expiresIn ?? res.data?.expires_in ?? 600);
     if (!token) {
-      logger.warn('[auth] Service token endpoint returned no token');
+      logger.warn('[auth] Service-token endpoint returned no token for tenant %s', tenantId);
       return null;
     }
-    cachedToken = { value: token, expiresAt: now + expiresIn * 1000 };
+
+    tokenCache.set(tenantId, { value: token, expiresAt: Date.now() + expiresIn * 1000 });
     return token;
   } catch (err: any) {
-    logger.warn('[auth] Failed to obtain service token: %s', err.message);
-    const fallback = tenantId ? buildTenantScopedFallbackToken(tenantId, userId) : null;
-    if (!fallback) {
-      logger.warn('[auth] JWT fallback token unavailable after auth-server failure');
-    }
-    return fallback;
+    const status = err?.response?.status;
+    logger.warn(
+      '[auth] Failed to obtain a service token for tenant %s (status=%s): %s',
+      tenantId, status ?? 'n/a', err?.response?.data?.message ?? err?.message ?? err,
+    );
+    return null;
   }
+}
+
+/** Test/ops hook — drop cached service tokens. */
+export function clearServiceTokenCache(): void {
+  tokenCache.clear();
 }

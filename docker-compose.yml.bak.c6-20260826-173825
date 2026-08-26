@@ -5,7 +5,7 @@ services:
       dockerfile: Dockerfile
     container_name: nn-notification-service
     ports:
-      - '127.0.0.1:5070:5070'
+      - '5070:5070'
     env_file:
       - .env
     environment:

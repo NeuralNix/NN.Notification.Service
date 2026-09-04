@@ -90,17 +90,58 @@ function titleCase(value: string): string {
 }
 
 /**
+ * Query parameter that tells the frontend which company a link belongs to.
+ *
+ * An admin can hold memberships in several companies, but one browser holds
+ * ONE active company (it is an `organization_id` JWT claim in shared
+ * localStorage). So a bare path in an inbox opens under whatever company that
+ * browser happens to be signed into — which, for anyone with more than one, is
+ * regularly the wrong one: the page loads the wrong tenant, or 404s because the
+ * document belongs to the other company. Stamping the notification's own tenant
+ * on the link lets the frontend notice the mismatch and offer to switch.
+ *
+ * Kept in sync with `COMPANY_QUERY_PARAM` in
+ * NN.Platform.Frontend/app/src/lib/company-link.ts.
+ */
+export const COMPANY_QUERY_PARAM = 'company';
+
+/** Add `?company=<tenant>` unless the URL already carries one. */
+function withCompany(absolute: string, tenantId?: string | null): string {
+  const id = (tenantId ?? '').trim();
+  if (!id) return absolute;
+  try {
+    const url = new URL(absolute);
+    if (url.searchParams.has(COMPANY_QUERY_PARAM)) return absolute;
+    url.searchParams.set(COMPANY_QUERY_PARAM, id);
+    return url.toString();
+  } catch {
+    // Unparseable URL — better an un-stamped link than a mangled one.
+    return absolute;
+  }
+}
+
+/**
  * Turn a notification's actionUrl into something clickable from an inbox.
  * Relative paths are only usable inside the SPA, so they need the public
  * origin prefixed; anything already absolute is passed through untouched.
+ *
+ * `tenantId` is stamped on as `?company=` so the recipient lands in the company
+ * the notification is about — but only for links on our OWN frontend origin, so
+ * an actionUrl pointing at a third party is never annotated with a tenant id.
  */
-export function toAbsoluteUrl(actionUrl: string | null | undefined): string {
+export function toAbsoluteUrl(
+  actionUrl: string | null | undefined,
+  tenantId?: string | null,
+): string {
   const raw = (actionUrl ?? '').trim();
   if (!raw) return '';
-  if (/^https?:\/\//i.test(raw)) return raw;
   const base = (process.env.PUBLIC_FRONTEND_URL || '').replace(/\/$/, '');
+  if (/^https?:\/\//i.test(raw)) {
+    const ours = !!base && raw.toLowerCase().startsWith(base.toLowerCase());
+    return ours ? withCompany(raw, tenantId) : raw;
+  }
   if (!base) return '';
-  return `${base}/${raw.replace(/^\//, '')}`;
+  return withCompany(`${base}/${raw.replace(/^\//, '')}`, tenantId);
 }
 
 /**
@@ -160,7 +201,7 @@ export async function sendAdminNotificationEmail(n: Notification): Promise<void>
     const tenantName = orgName || 'Your organization';
     const categoryLabel = CATEGORY_LABELS[category] ?? titleCase(category);
     const severityLabel = SEVERITY_LABELS[severity] ?? titleCase(severity);
-    const actionUrl = toAbsoluteUrl(n.actionUrl);
+    const actionUrl = toAbsoluteUrl(n.actionUrl, n.tenantId);
 
     await publishEmailRequest({
       tenantId: n.tenantId,

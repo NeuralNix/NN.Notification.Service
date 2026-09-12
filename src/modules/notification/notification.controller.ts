@@ -1,6 +1,6 @@
 import { Request, Response } from 'express';
 import service from './notification.service';
-import { NotificationCategory } from '@prisma/client';
+import { NotificationCategory, NotificationSeverity } from '@prisma/client';
 import { publishRealtimeNotification } from '@/kafka/producer';
 import { resolveAllowedCategories, requiredDashboardsFor } from '@/access/dashboardAccess';
 import logger from '@/utils/logger';
@@ -21,18 +21,41 @@ function allowed(req: Request) {
 
 export class NotificationController {
   async create(req: Request, res: Response) {
-    const created = await service.create({
-      tenantId: tenant(req),
-      userId: req.body.userId ?? null,
-      category: req.body.category as NotificationCategory,
-      severity: req.body.severity,
-      title: String(req.body.title ?? ''),
-      message: String(req.body.message ?? ''),
-      actionUrl: req.body.actionUrl ? String(req.body.actionUrl) : undefined,
-      data: req.body.data,
-      sourceEventId: req.body.sourceEventId ? String(req.body.sourceEventId) : undefined,
-      sourceTopic: req.body.sourceTopic ? String(req.body.sourceTopic) : undefined,
-    });
+    // Validate before Prisma sees the value: an unknown category used to reach
+    // prisma.notification.findFirst() as a raw string, throw a
+    // PrismaClientValidationError out of this async handler, and take the whole
+    // process down (unhandled rejection) — one bad payload from any internal
+    // caller restarted the service for everyone.
+    const category = String(req.body.category ?? '');
+    if (!(Object.values(NotificationCategory) as string[]).includes(category)) {
+      return res.status(400).json({
+        message: `Unknown category '${category}'. Expected one of: ${Object.values(NotificationCategory).join(', ')}`,
+      });
+    }
+    const severity = String(req.body.severity ?? 'info');
+    if (!(Object.values(NotificationSeverity) as string[]).includes(severity)) {
+      return res.status(400).json({
+        message: `Unknown severity '${severity}'. Expected one of: ${Object.values(NotificationSeverity).join(', ')}`,
+      });
+    }
+    let created;
+    try {
+      created = await service.create({
+        tenantId: tenant(req),
+        userId: req.body.userId ?? null,
+        category: category as NotificationCategory,
+        severity: severity as NotificationSeverity,
+        title: String(req.body.title ?? ''),
+        message: String(req.body.message ?? ''),
+        actionUrl: req.body.actionUrl ? String(req.body.actionUrl) : undefined,
+        data: req.body.data,
+        sourceEventId: req.body.sourceEventId ? String(req.body.sourceEventId) : undefined,
+        sourceTopic: req.body.sourceTopic ? String(req.body.sourceTopic) : undefined,
+      });
+    } catch (error: any) {
+      logger.error('[notifications] create failed: %s', error?.message ?? error);
+      return res.status(500).json({ message: 'Could not store the notification' });
+    }
     try {
       const data = (req.body.data && typeof req.body.data === 'object') ? req.body.data : {};
       const eventType = typeof data.eventType === 'string' ? data.eventType : undefined;

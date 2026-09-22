@@ -123,18 +123,27 @@ export class NotificationService {
   /// implicitly AND'd with `createdAt >= sinceAt` by the caller so users
   /// never see notifications older than their own join cutoff.
   ///
-  /// Branches:
+  /// ACTIVE COMPANY ONLY. Both branches pin `tenantId` to the caller's active
+  /// company:
   ///   1. Tenant broadcast (userId=null) inside the active tenant.
   ///   2. User-targeted row inside the active tenant.
-  ///   3. User-targeted row in a different tenant — but only if the user
-  ///      has previously observed that tenant (i.e. has a cutoff row for
-  ///      it). This keeps the existing cross-tenant override path for
-  ///      operators that switched active org while making sure brand-new
-  ///      users don't inherit notifications from "other dashboards".
-  ///   Broadcast rows (branch 1) are additionally scoped by the caller's
-  ///   dashboard access: a user without the Operations Dashboard never sees
-  ///   estimate/invoice/job broadcasts. Targeted rows (branches 2-3) are
-  ///   exempt — they were explicitly addressed to the user.
+  /// Broadcast rows are additionally scoped by the caller's dashboard access:
+  /// a user without the Operations Dashboard never sees estimate/invoice/job
+  /// broadcasts. Targeted rows are exempt — they were addressed to the user.
+  ///
+  /// There used to be a third branch: user-targeted rows in ANY other tenant
+  /// the user held a cutoff row for, so an "operator who switched active org"
+  /// kept receiving the old org's notifications. That was the cross-company
+  /// leak — a cutoff row is written by `getOrCreateCutoff` on the user's FIRST
+  /// READ of a company, so simply opening the bell in a company granted
+  /// permanent visibility of its targeted notifications from every other
+  /// company thereafter. Live proof (2026-09-21): the three "Alert resolved —
+  /// estimate alert EA001 … by Roy Morici" rows belong to Generator Repair
+  /// Service and were listed for users working in UGPUS.
+  ///
+  /// The rule matches agent chat scope: what you can read is decided by the
+  /// company you are IN, never by the companies you belong to. A notification
+  /// for another company is reachable by switching to that company.
   private async buildVisibility(
     tenantId: string,
     userId: string | undefined,
@@ -145,16 +154,6 @@ export class NotificationService {
     const branches: Prisma.NotificationWhereInput[] = [broadcast];
     if (!userId) return branches;
     branches.push({ tenantId, userId });
-    const otherTenants = await prisma.notificationVisibilityCutoff.findMany({
-      where: { userId, NOT: { tenantId } },
-      select: { tenantId: true },
-    });
-    if (otherTenants.length > 0) {
-      branches.push({
-        userId,
-        tenantId: { in: otherTenants.map((t) => t.tenantId) },
-      });
-    }
     return branches;
   }
 

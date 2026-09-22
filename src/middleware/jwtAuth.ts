@@ -158,6 +158,13 @@ export function authenticate(req: Request, res: Response, next: NextFunction) {
   );
 }
 
+/// True for the service-to-service CREATE call every backend makes
+/// (`POST /api/notifications`). Mirrors the path `authenticate` already scopes
+/// its no-bearer service branch to.
+function isServiceCreate(req: Request): boolean {
+  return req.method === 'POST' && req.path === '/';
+}
+
 export function requireTenant(req: Request, res: Response, next: NextFunction) {
   const overrideTenantId = requestedTenantId(req);
 
@@ -171,7 +178,15 @@ export function requireTenant(req: Request, res: Response, next: NextFunction) {
     return next();
   }
 
-  if (req.user && hasTrustedProxyOverride(req)) {
+  // The trusted proxy secret authorises a backend WRITING a notification into a
+  // tenant it names (Operations/HR/CRM/Inventory/PhoneServices all post with a
+  // user bearer AND the secret). It must NEVER authorise a READ of another
+  // tenant: the platform frontend's own proxy used to attach this secret to the
+  // caller's `X-Organization-Id` header on GET/PATCH, and that header comes
+  // straight from the browser — so any signed-in user could have read, and
+  // marked read, the bell of any company by naming its id, with no membership
+  // check at all. Reads fall through to the membership-verified branch below.
+  if (req.user && hasTrustedProxyOverride(req) && isServiceCreate(req)) {
     req.user.tenantId = overrideTenantId;
     return next();
   }

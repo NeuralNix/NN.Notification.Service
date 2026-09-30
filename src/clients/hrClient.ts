@@ -1,5 +1,7 @@
-// Thin client for the HR backend (NN.HR), used to resolve which users are
-// administrators of a tenant so admin-facing emails have recipients.
+// Thin client for the HR backend (NN.HR), used to resolve who gets notification
+// emails: every active member with "Send notifications as emails" on in HR →
+// Users (on by default for admins, off for everyone else), with the dashboards
+// that decide which notifications they can see.
 //
 // "Admin" is deliberately defined the same way NN.Operational.Backend's
 // AdminPaymentNotifier defines it — HR `userType == "Admin"`, active, with an
@@ -32,14 +34,34 @@ const ADMIN_FAILURE_TTL_MS = Number(process.env.HR_ADMIN_FAILURE_TTL_MS || 30_00
 const REQUEST_TIMEOUT_MS = Number(process.env.HR_REQUEST_TIMEOUT_MS || 15_000);
 
 interface HrEmployee {
+  userId?: string | null;
   email?: string | null;
+  /** Active | Invited | Inactive */
   status?: string | null;
+  /** False when the login is disabled. */
+  isActive?: boolean | null;
   /** Admin | PlatformUser | Employee */
   userType?: string | null;
+  dashboardAccess?: string[] | null;
+  /**
+   * The effective "Send notifications as emails" setting. Absent when HR
+   * predates it — then admins get emails and nobody else does, which is
+   * exactly how notification emails worked before the setting existed.
+   */
+  notificationEmails?: boolean | null;
+}
+
+/** Someone who gets notification emails, and what they may see. */
+export interface NotificationRecipient {
+  userId: string;
+  email: string;
+  isAdmin: boolean;
+  /** Lower-cased dashboard ids (Platform Users); admins see every dashboard. */
+  dashboards: string[];
 }
 
 interface CacheEntry {
-  emails: string[];
+  recipients: NotificationRecipient[];
   expiresAt: number;
 }
 
@@ -60,41 +82,55 @@ function asList(payload: unknown): HrEmployee[] {
   return [];
 }
 
-function extractAdminEmails(employees: HrEmployee[]): string[] {
+const EMPTY_GUID = '00000000-0000-0000-0000-000000000000';
+
+/** Exported for testing. */
+export function extractRecipients(employees: HrEmployee[]): NotificationRecipient[] {
   const seen = new Set<string>();
-  const out: string[] = [];
+  const out: NotificationRecipient[] = [];
   for (const e of employees) {
-    if ((e.userType ?? '').toLowerCase() !== 'admin') continue;
-    if ((e.status ?? '').toLowerCase() === 'inactive') continue;
+    const status = (e.status ?? '').toLowerCase();
+    // Disabled members and invitations nobody has accepted yet get nothing.
+    if (status === 'inactive' || status === 'invited' || e.isActive === false) continue;
+    const userId = (e.userId ?? '').trim();
+    if (!userId || userId === EMPTY_GUID) continue;
+    const isAdmin = (e.userType ?? '').toLowerCase() === 'admin';
+    if (!(e.notificationEmails ?? isAdmin)) continue;
     const email = (e.email ?? '').trim();
     if (!email || !email.includes('@')) continue;
     const key = email.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
-    out.push(email);
+    out.push({
+      userId,
+      email,
+      isAdmin,
+      dashboards: (e.dashboardAccess ?? []).filter((d) => typeof d === 'string').map((d) => d.toLowerCase()),
+    });
   }
   return out;
 }
 
-function cacheAndReturn(tenantId: string, emails: string[], ttl: number): string[] {
-  cache.set(tenantId, { emails, expiresAt: Date.now() + ttl });
-  return emails;
+function cacheAndReturn(tenantId: string, recipients: NotificationRecipient[], ttl: number): NotificationRecipient[] {
+  cache.set(tenantId, { recipients, expiresAt: Date.now() + ttl });
+  return recipients;
 }
 
 /**
- * Email addresses of a tenant's admin users. Cached briefly so a burst of
- * notifications doesn't hammer HR (and the Auth Server behind it) once per
- * notification.
+ * Everyone in the tenant who gets notification emails. Cached briefly so a
+ * burst of notifications doesn't hammer HR (and the Auth Server behind it)
+ * once per notification — which also means a change in HR → Users takes up to
+ * HR_ADMIN_CACHE_TTL_MS (2 min) to reach the emails.
  */
-export async function listAdminEmails(tenantId: string): Promise<string[]> {
+export async function listNotificationRecipients(tenantId: string): Promise<NotificationRecipient[]> {
   if (!tenantId) return [];
 
   const cached = cache.get(tenantId);
-  if (cached && cached.expiresAt > Date.now()) return cached.emails;
+  if (cached && cached.expiresAt > Date.now()) return cached.recipients;
 
   const token = await getServiceToken(tenantId);
   if (!token) {
-    logger.warn('[hr] No service token for tenant %s — cannot resolve admins', tenantId);
+    logger.warn('[hr] No service token for tenant %s — cannot resolve notification email recipients', tenantId);
     return cacheAndReturn(tenantId, [], ADMIN_FAILURE_TTL_MS);
   }
 
@@ -103,10 +139,10 @@ export async function listAdminEmails(tenantId: string): Promise<string[]> {
       headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
       timeout: REQUEST_TIMEOUT_MS,
     });
-    return cacheAndReturn(tenantId, extractAdminEmails(asList(res.data)), ADMIN_CACHE_TTL_MS);
+    return cacheAndReturn(tenantId, extractRecipients(asList(res.data)), ADMIN_CACHE_TTL_MS);
   } catch (err: any) {
     logger.warn(
-      '[hr] Failed to resolve admin emails for tenant %s (status=%s): %s',
+      '[hr] Failed to resolve notification email recipients for tenant %s (status=%s): %s',
       tenantId, err?.response?.status ?? 'n/a', err?.message ?? err,
     );
     // Short negative cache so a flapping HR isn't retried once per notification.
@@ -115,6 +151,6 @@ export async function listAdminEmails(tenantId: string): Promise<string[]> {
 }
 
 /** Test/ops hook — drop cached recipient lists. */
-export function clearAdminEmailCache(): void {
+export function clearRecipientCache(): void {
   cache.clear();
 }

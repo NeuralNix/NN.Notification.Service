@@ -1,28 +1,39 @@
-// Emails a tenant's administrators whenever a notification is created.
+// Emails a copy of each new notification to the people who get it in their
+// bell and have "Send notifications as emails" on (HR → Users → Edit user
+// access). It is on by default for Platform Admins — before the setting
+// existed, every admin was emailed every tenant-wide notification — and off by
+// default for everyone else.
 //
-// Pipeline: this module publishes an `emails.outbound` Kafka request (the
-// producer helper already existed but had no callers) → NN.UGP.Email.Service's
-// KafkaEmailConsumer turns it into a pending Email row against the
-// `admin-notification-alert` template → EmailWorker renders and sends it.
-// Because it goes through the template system, admins can edit the wording at
-// Operations → Email Templates without a redeploy.
+// Who is emailed mirrors who can SEE the notification (src/access):
+//   • tenant-wide (userId null): admins, plus members with a dashboard the
+//     category belongs to (every member keeps HR self-service);
+//   • addressed to one user: that user only. ADMIN_NOTIFICATION_EMAIL_SCOPE=all
+//     also copies opted-in admins, as that setting did before.
+// Each recipient gets their own email, so nobody sees who else was sent it.
+//
+// Pipeline: this module publishes `emails.outbound` Kafka requests →
+// NN.UGP.Email.Service's KafkaEmailConsumer turns each into a pending Email row
+// against the `admin-notification-alert` template → EmailWorker renders and
+// sends it, through the company's own email system when it has one. Because it
+// goes through the template system, the wording is editable without a deploy.
 //
 // Two rules this module exists to enforce:
 //   1. It NEVER throws. Notification creation is the caller's real work; a
 //      mail failure must not roll it back or surface to the API consumer.
 //   2. It only fires for genuinely NEW notifications. The create() path is
 //      idempotent on sourceEventId, so re-delivered Kafka messages must not
-//      re-mail admins.
+//      re-mail anyone.
 
 import type { Notification } from '@prisma/client';
 import { publishEmailRequest } from '@/kafka/producer';
-import { listAdminEmails } from '@/clients/hrClient';
+import { listNotificationRecipients, type NotificationRecipient } from '@/clients/hrClient';
 import { getOrganizationName } from '@/clients/organizationClient';
+import { requiredDashboardsFor } from '@/access/dashboardAccess';
 import logger from '@/utils/logger';
 
 export const ADMIN_NOTIFICATION_TEMPLATE_SLUG = 'admin-notification-alert';
 
-/** Which notifications to mail about: every one, or tenant-wide broadcasts only. */
+/** Whether admins are also copied on notifications addressed to one user. */
 type Scope = 'all' | 'broadcast';
 
 function flag(name: string, fallback: boolean): boolean {
@@ -145,18 +156,13 @@ export function toAbsoluteUrl(
 }
 
 /**
- * True when this notification should generate an admin email, based on the
- * configured scope / category / severity filters. Exported for testing.
+ * True when this notification should be emailed at all, based on the
+ * operator's category / severity filters. Exported for testing.
  */
-export function shouldEmailAdmins(
-  n: Pick<Notification, 'userId' | 'category' | 'severity'>,
+export function shouldEmail(
+  n: Pick<Notification, 'category' | 'severity'>,
 ): boolean {
   if (!flag('ADMIN_NOTIFICATION_EMAILS_ENABLED', true)) return false;
-
-  // Targeted notifications are personal (a payslip, an approved leave
-  // request) and already reach their addressee. Copying every admin on them
-  // is a privacy call, so it is opt-in via scope=all.
-  if (resolveScope() === 'broadcast' && n.userId) return false;
 
   const categories = csv('ADMIN_NOTIFICATION_EMAIL_CATEGORIES');
   if (categories.length > 0 && !categories.includes(String(n.category).toLowerCase())) return false;
@@ -167,31 +173,58 @@ export function shouldEmailAdmins(
   return true;
 }
 
+/** Same rule as the bell (src/access/dashboardAccess.ts) for a tenant-wide notification. */
+function canSee(r: NotificationRecipient, category: string): boolean {
+  if (r.isAdmin) return true;
+  const required = requiredDashboardsFor(category);
+  if (required.length === 0) return true;
+  const granted = new Set([...r.dashboards, 'hr']);
+  return required.some((d) => granted.has(d));
+}
+
 /**
- * Fire the admin alert for a freshly-created notification. Safe to await:
- * resolves rather than rejects on every failure path.
+ * Who is emailed about this notification, from the opted-in members. Exported
+ * for testing.
  */
-export async function sendAdminNotificationEmail(n: Notification): Promise<void> {
+export function recipientsFor(
+  n: Pick<Notification, 'userId' | 'category'>,
+  optedIn: NotificationRecipient[],
+): NotificationRecipient[] {
+  if (!n.userId) return optedIn.filter((r) => canSee(r, String(n.category)));
+  // Addressed to one person (a payslip, an approved leave request, an alert
+  // assigned to them): theirs alone. Copying admins is a privacy call, so it
+  // stays opt-in via scope=all.
+  const out = optedIn.filter((r) => r.userId === n.userId);
+  if (resolveScope() === 'all') out.push(...optedIn.filter((r) => r.isAdmin && r.userId !== n.userId));
+  return out;
+}
+
+/**
+ * Email a freshly-created notification to everyone who should get it. Safe to
+ * await: resolves rather than rejects on every failure path.
+ */
+export async function sendNotificationEmails(n: Notification): Promise<void> {
   try {
-    if (!shouldEmailAdmins(n)) return;
+    if (!shouldEmail(n)) return;
 
     if (!withinRateLimit(n.tenantId)) {
       logger.warn(
-        '[admin-email] Hourly cap (%d) reached for tenant %s — skipping alert for notification %s',
+        '[notification-email] Hourly cap (%d) reached for tenant %s — skipping email for notification %s',
         MAX_PER_HOUR, n.tenantId, n.id,
       );
       return;
     }
 
-    const [recipients, orgName] = await Promise.all([
-      listAdminEmails(n.tenantId),
+    const [optedIn, orgName] = await Promise.all([
+      listNotificationRecipients(n.tenantId),
       getOrganizationName(n.tenantId),
     ]);
+    const recipients = recipientsFor(n, optedIn);
 
     if (recipients.length === 0) {
       logger.info(
-        '[admin-email] No admin recipients for tenant %s — skipping alert for notification %s',
-        n.tenantId, n.id,
+        '[notification-email] Nobody to email for notification %s (tenant %s, %d opted in)',
+        n.id, n.tenantId, optedIn.length,
       );
       return;
     }
@@ -203,43 +236,48 @@ export async function sendAdminNotificationEmail(n: Notification): Promise<void>
     const severityLabel = SEVERITY_LABELS[severity] ?? titleCase(severity);
     const actionUrl = toAbsoluteUrl(n.actionUrl, n.tenantId);
 
-    await publishEmailRequest({
-      tenantId: n.tenantId,
-      to: recipients,
-      templateType: ADMIN_NOTIFICATION_TEMPLATE_SLUG,
-      // Warn/error alerts jump the send queue ahead of routine info mail.
-      priority: severity === 'error' || severity === 'warn' ? 'high' : 'normal',
-      templateData: {
-        // The worker re-renders the template's own subject at send time, so
-        // this value is what lands in the Email Log row. Without it the log
-        // shows the consumer's "Notification: <slug>" placeholder.
-        subject: `[${categoryLabel}] ${n.title}`,
-        tenantName,
-        notificationId: n.id,
-        notificationTitle: n.title,
-        notificationMessage: n.message,
-        category,
-        categoryLabel,
-        severity,
-        severityLabel,
-        isAlert: severity === 'warn' || severity === 'error',
-        actionUrl,
-        occurredAt: n.createdAt.toISOString(),
-        // Broadcast vs targeted, so an admin can tell whether the whole org
-        // saw this or it was addressed to one person.
-        audience: n.userId ? 'A single user' : 'Everyone in the organization',
-      },
-    });
+    const templateData = {
+      // The worker re-renders the template's own subject at send time, so
+      // this value is what lands in the Email Log row. Without it the log
+      // shows the consumer's "Notification: <slug>" placeholder.
+      subject: `[${categoryLabel}] ${n.title}`,
+      tenantName,
+      notificationId: n.id,
+      notificationTitle: n.title,
+      notificationMessage: n.message,
+      category,
+      categoryLabel,
+      severity,
+      severityLabel,
+      isAlert: severity === 'warn' || severity === 'error',
+      actionUrl,
+      occurredAt: n.createdAt.toISOString(),
+      // Broadcast vs targeted, so the reader can tell whether the whole org
+      // saw this or it was addressed to one person.
+      audience: n.userId ? 'A single user' : 'Everyone in the organization',
+    };
+    // One email per person: a shared To: line would show every recipient's
+    // address to everyone else, and not all of them are admins.
+    for (const r of recipients) {
+      await publishEmailRequest({
+        tenantId: n.tenantId,
+        to: [r.email],
+        templateType: ADMIN_NOTIFICATION_TEMPLATE_SLUG,
+        // Warn/error alerts jump the send queue ahead of routine info mail.
+        priority: severity === 'error' || severity === 'warn' ? 'high' : 'normal',
+        templateData,
+      });
+    }
 
     logger.info(
-      '[admin-email] Queued %s alert for notification %s (category=%s severity=%s) to %d admin(s)',
+      '[notification-email] Queued %s for notification %s (category=%s severity=%s) to %d recipient(s)',
       ADMIN_NOTIFICATION_TEMPLATE_SLUG, n.id, category, severity, recipients.length,
     );
   } catch (err: any) {
     // Swallow: the notification itself is already persisted and is the
     // caller's contract. Mail is best-effort.
     logger.error(
-      '[admin-email] Failed to queue admin alert for notification %s: %s',
+      '[notification-email] Failed to queue notification email for notification %s: %s',
       n?.id, err?.message ?? err,
     );
   }

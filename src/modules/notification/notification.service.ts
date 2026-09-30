@@ -1,6 +1,6 @@
 import prisma from '@/config/prisma';
 import { NotificationCategory, NotificationSeverity, Prisma } from '@prisma/client';
-import { sendAdminNotificationEmail } from '@/email/adminNotificationEmail';
+import { sendNotificationEmails } from '@/email/notificationEmail';
 import logger from '@/utils/logger';
 
 export interface CreateNotificationInput {
@@ -86,7 +86,8 @@ export class NotificationService {
       },
     });
 
-    // Mail the tenant's admins about the new notification. Deliberately only
+    // Email the new notification to whoever gets it and opted in (HR → Users →
+    // Send notifications as emails). Deliberately only
     // on this path: the idempotent short-circuit and the fallback-replace
     // branch above both return pre-existing rows, and re-delivered Kafka
     // messages must not produce duplicate alerts.
@@ -99,7 +100,7 @@ export class NotificationService {
     // unhandled rejection. Trade-off: an alert in flight when the process
     // stops is lost, which is the right side to fail on for a best-effort
     // notification email.
-    void sendAdminNotificationEmail(created);
+    void sendNotificationEmails(created);
 
     return created;
   }
